@@ -48,6 +48,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/component-base/metrics/prometheus/ratelimiter"
 	"k8s.io/klog/v2"
+	clock "k8s.io/utils/clock"
 
 	"github.com/caoyingjunz/pixiu-autoscaler/pkg/controller"
 )
@@ -89,6 +90,11 @@ type AutoscalerController struct {
 
 	// Store and returns a reference to an empty store.
 	items map[string]controller.Empty
+
+	// clock 用于指标缺失宽限/退避的时间判定，生产为真实时钟，测试可注入 fake clock
+	clock clock.Clock
+	// degrade 维护 HPA 指标持续缺失的状态机（hold/reclaim）
+	degrade *metricMissingMonitor
 }
 
 // NewAutoscalerController creates a new AutoscalerController.
@@ -97,15 +103,24 @@ func NewAutoscalerController(
 	hpaInformer autoscalinginformers.HorizontalPodAutoscalerInformer,
 	cmInformer coreinformers.ConfigMapInformer,
 	client clientset.Interface) (*AutoscalerController, error) {
-	eventBroadcaster := record.NewBroadcaster()
-	eventBroadcaster.StartLogging(klog.Infof)
-	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: client.CoreV1().Events("")})
-
 	if client != nil && client.CoreV1().RESTClient().GetRateLimiter() != nil {
 		if err := ratelimiter.RegisterMetricAndTrackRateLimiterUsage("pixiu_autoscaler", client.CoreV1().RESTClient().GetRateLimiter()); err != nil {
 			return nil, err
 		}
 	}
+	return newAutoscalerController(dInformer, hpaInformer, cmInformer, client)
+}
+
+// newAutoscalerController 组装控制器主体，不触碰进程级 Prometheus 注册表，
+// 以便离线测试可重复构造。
+func newAutoscalerController(
+	dInformer appsinformers.DeploymentInformer,
+	hpaInformer autoscalinginformers.HorizontalPodAutoscalerInformer,
+	cmInformer coreinformers.ConfigMapInformer,
+	client clientset.Interface) (*AutoscalerController, error) {
+	eventBroadcaster := record.NewBroadcaster()
+	eventBroadcaster.StartLogging(klog.Infof)
+	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: client.CoreV1().Events("")})
 
 	ac := &AutoscalerController{
 		client:        client,
@@ -113,7 +128,9 @@ func NewAutoscalerController(
 		queue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "pixiu"),
 		cmQueue:       workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "pixiu"),
 		items:         controller.NewItems(),
+		clock:         clock.RealClock{},
 	}
+	ac.degrade = newMetricMissingMonitor(ac.clock, ac.eventRecorder)
 
 	// Deployment
 	dInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -152,6 +169,25 @@ func NewAutoscalerController(
 	ac.hpaListerSynced = hpaInformer.Informer().HasSynced
 	ac.cmListerSynced = cmInformer.Informer().HasSynced
 
+	return ac, nil
+}
+
+// newAutoscalerControllerForTest 构造允许注入时钟与事件记录器的控制器，
+// 仅供离线测试使用；生产路径仍走 NewAutoscalerController。
+func newAutoscalerControllerForTest(
+	dInformer appsinformers.DeploymentInformer,
+	hpaInformer autoscalinginformers.HorizontalPodAutoscalerInformer,
+	cmInformer coreinformers.ConfigMapInformer,
+	client clientset.Interface,
+	c clock.Clock,
+	recorder record.EventRecorder) (*AutoscalerController, error) {
+	ac, err := newAutoscalerController(dInformer, hpaInformer, cmInformer, client)
+	if err != nil {
+		return nil, err
+	}
+	ac.clock = c
+	ac.degrade = newMetricMissingMonitor(c, recorder)
+	ac.eventRecorder = recorder
 	return ac, nil
 }
 
@@ -341,6 +377,8 @@ func (ac *AutoscalerController) syncAutoscalers(key string) error {
 	deployment, err := ac.dLister.Deployments(namespace).Get(name)
 	if errors.IsNotFound(err) {
 		klog.V(2).InfoS("Deployment has been deleted", "deployment", klog.KRef(namespace, name))
+		// 清理指标缺失状态机，避免悬挂状态泄漏。
+		delete(ac.degrade.states, namespace+"/"+name)
 		return nil
 	}
 	if err != nil {
@@ -357,7 +395,88 @@ func (ac *AutoscalerController) syncAutoscalers(key string) error {
 	if err != nil {
 		return err
 	}
+
+	// 指标缺失降级观测（hold/reclaim）。未配置注解时为 no-op，保持既有行为。
+	stop, err := ac.observeMetricMissing(d, hpaList)
+	if err != nil {
+		return err
+	}
+	if stop {
+		return nil
+	}
 	return ac.sync(d, hpaList)
+}
+
+// observeMetricMissing 驱动指标缺失状态机并执行 reclaim/recreate 动作。
+// 返回 stop=true 表示本次不应再执行常规 spec 同步（reclaim 已删除 HPA、
+// 或退避尚未到期）。重新入队由本函数按状态机结论安排。
+func (ac *AutoscalerController) observeMetricMissing(d *appsv1.Deployment,
+	hpaList []*autoscalingv2.HorizontalPodAutoscaler) (stop bool, err error) {
+	key, err := controller.KeyFunc(d)
+	if err != nil {
+		return false, err
+	}
+
+	decision := ac.degrade.observe(d, hpaList)
+	if decision.requeueAfter > 0 {
+		ac.queue.AddAfter(key, decision.requeueAfter)
+	}
+
+	switch decision.action {
+	case actionReclaim:
+		// 仅回收本控制器托管（owner 匹配）的 HPA，外来 HPA 不可删除；
+		// 目标 Deployment 副本数保持当前值，不回 minReplicas，不写状态注解。
+		// 与常规 sync 一致，同一 Deployment 若存在重复托管 HPA 一并收敛。
+		var managed []*autoscalingv2.HorizontalPodAutoscaler
+		for _, h := range hpaList {
+			if ac.isOwnedByDeployment(h, d) {
+				managed = append(managed, h)
+			}
+		}
+		if len(managed) == 0 {
+			klog.V(2).InfoS("metric-missing: skip reclaim, no HPA is owned by this deployment",
+				"deployment", klog.KObj(d))
+			return true, nil
+		}
+		if err = ac.deleteHPAsInBatch(managed); err != nil {
+			return false, err
+		}
+		return true, nil
+	case actionRecreate:
+		// 使用最新 Deployment 注解重新生成有效规格，拒绝旧快照覆盖。
+		newHPA, buildErr := controller.CreateHPAFromDeployment(d)
+		if buildErr != nil {
+			return false, buildErr
+		}
+		if ac.IsCustomMetricHPA(d) {
+			newHPA.Labels[controller.PrometheusCustomMetric] = "true"
+		}
+		if _, createErr := ac.client.AutoscalingV2().HorizontalPodAutoscalers(newHPA.Namespace).Create(
+			context.TODO(), newHPA, metav1.CreateOptions{}); createErr != nil {
+			if errors.IsAlreadyExists(createErr) {
+				// 已被其他路径创建：交由常规 sync 收敛，监控器在下次观测时复位。
+				return true, nil
+			}
+			return false, createErr
+		}
+		ac.eventRecorder.Eventf(newHPA, v1.EventTypeNormal, "CreateHPA",
+			fmt.Sprintf("Recreate HPA %s/%s after metrics-missing reclaim", newHPA.Namespace, newHPA.Name))
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+// isOwnedByDeployment 确认 HPA 的 controller owner 指向给定 Deployment，
+// 防止 reclaim 误删外来 HPA。
+func (ac *AutoscalerController) isOwnedByDeployment(hpa *autoscalingv2.HorizontalPodAutoscaler,
+	d *appsv1.Deployment) bool {
+	controllerRef := metav1.GetControllerOf(hpa)
+	if controllerRef == nil {
+		return false
+	}
+	return controllerRef.Kind == controller.Deployment &&
+		controllerRef.Name == d.Name && d.UID == controllerRef.UID
 }
 
 func (ac *AutoscalerController) sync(d *appsv1.Deployment, hpaList []*autoscalingv2.HorizontalPodAutoscaler) error {
